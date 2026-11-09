@@ -1,41 +1,95 @@
 const express = require('express');
-const bodyParser = require('body-parser');
 const cors = require('cors');
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
 app.use(cors());
 
-// Вставьте сюда данные вашего Telegram-бота
-const TELEGRAM_BOT_TOKEN = '8708160027:AAELrgFRhuphx46y-rGbtT2ugixNI55lSkw';
-const TELEGRAM_CHAT_ID = '-1003947748195';
+// Токен и ID чата берём из переменных окружения Render (Environment), а не из кода
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.error('Не заданы переменные окружения TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID');
+    process.exit(1);
+}
+
+// --- ФОРМИРОВАНИЕ СООБЩЕНИЯ: начало ---
+
+// Экранирование для parse_mode: 'HTML'. Без него символы вроде [ _ * < & в тексте
+// клиента (имя, комментарий, название с соусами) могут сломать разбор, и Telegram отклонит сообщение.
+const esc = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+// Убирает хвосты вида 15.000000000000002 после умножения
+const money = (n) => String(Math.round(n * 100) / 100);
+
+function buildMessage({ customerName, phone, paymentMethod, comment, cartItems }) {
+    let totalPrice = 0;
+
+    const itemsList = cartItems.map((item) => {
+        const quantity = Number(item.quantity) || 1;
+        const price = Number(item.price) || 0;
+        const itemTotal = quantity * price;
+        totalPrice += itemTotal;
+
+        // menu.js дописывает соусы к названию: "Буррито (M (350г)) [Соусы: Сальса, Кетчуп]".
+        // Отделяем их от названия, чтобы вывести отдельной строкой.
+        const fullName = String(item.name ?? 'Товар');
+        const match = fullName.match(/^(.*?)\s*\[Соусы:\s*(.*)\]\s*$/);
+        const title = match ? match[1] : fullName;
+        const sauces = match ? match[2] : '';
+
+        let line = `▪️ ${esc(title)} — ${quantity} шт. × ${money(price)} руб. = ${money(itemTotal)} руб.`;
+        if (sauces) {
+            line += `\n🥫 Соусы: ${esc(sauces)}`;
+        }
+        return line;
+    }).join('\n');
+
+    return `🛒 <b>НОВЫЙ ЗАКАЗ!</b>\n\n` +
+           `👤 <b>Имя:</b> ${esc(customerName)}\n` +
+           `📞 <b>Телефон:</b> ${esc(phone)}\n` +
+           `💳 <b>Оплата:</b> ${esc(paymentMethod)}\n` +
+           `💬 <b>Комментарий:</b> ${esc(comment || 'нет')}\n\n` +
+           `🍔 <b>Состав заказа:</b>\n${itemsList}\n\n` +
+           `💰 <b>Итого к оплате:</b> ${money(totalPrice)} руб.`;
+}
+
+// --- ФОРМИРОВАНИЕ СООБЩЕНИЯ: конец ---
 
 app.post('/api/order', async (req, res) => {
     try {
-        const { customerName, phone, paymentMethod, comment, cartItems } = req.body;
+        // Понимаем оба варианта названий полей:
+        // customerName / paymentMethod / cartItems  и  name / payment / cart
+        const body = req.body || {};
+        const order = {
+            customerName: body.customerName ?? body.name,
+            phone: body.phone,
+            paymentMethod: body.paymentMethod ?? body.payment,
+            comment: body.comment,
+            cartItems: body.cartItems ?? body.cart
+        };
 
-        if (!cartItems || cartItems.length === 0) {
+        if (!Array.isArray(order.cartItems) || order.cartItems.length === 0) {
             return res.status(400).json({ success: false, error: 'Корзина пуста' });
         }
+        if (order.cartItems.length > 30) {
+            return res.status(400).json({ success: false, error: 'Слишком много позиций в заказе' });
+        }
+        if (!order.customerName || !order.phone) {
+            return res.status(400).json({ success: false, error: 'Укажите имя и телефон' });
+        }
 
-        // Считаем общую сумму и формируем список товаров
-        let totalPrice = 0;
-        let itemsList = cartItems.map(item => {
-            const itemTotal = (item.price || 0) * (item.quantity || 1);
-            totalPrice += itemTotal;
-            return `▪️ ${item.name} — ${item.quantity} шт. × ${item.price} руб. = ${itemTotal} руб.`;
-        }).join('\n');
+        const message = buildMessage(order);
 
-        // Текст сообщения, который прилетит в Telegram-чат
-        let message = `🛒 *НОВЫЙ ЗАКАЗ!*\n\n` +
-                      `👤 *Имя:* ${customerName}\n` +
-                      `📞 *Телефон:* ${phone}\n` +
-                      `💳 *Оплата:* ${paymentMethod}\n` +
-                      `💬 *Комментарий:* ${comment || 'нет'}\n\n` +
-                      `🍔 *Состав заказа:*\n${itemsList}\n\n` +
-                      `💰 *Итого к оплате:* ${totalPrice} руб.`;
+        // Лимит Telegram на одно сообщение — 4096 символов
+        if (message.length > 4000) {
+            return res.status(400).json({ success: false, error: 'Заказ слишком большой' });
+        }
 
-        // Отправка запроса в Telegram API (используем встроенный в Node.js fetch)
         const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
         const response = await fetch(telegramUrl, {
             method: 'POST',
@@ -43,7 +97,7 @@ app.post('/api/order', async (req, res) => {
             body: JSON.stringify({
                 chat_id: TELEGRAM_CHAT_ID,
                 text: message,
-                parse_mode: 'Markdown'
+                parse_mode: 'HTML'
             })
         });
 
